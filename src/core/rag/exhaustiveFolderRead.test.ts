@@ -1,0 +1,165 @@
+import { App, TFile } from 'obsidian'
+
+import { DEFAULT_CHAT_MODELS, DEFAULT_PROVIDERS } from '../../constants'
+import { SmartComposerSettings } from '../../settings/schema/setting.types'
+import { getChatModelClient } from '../llm/manager'
+
+import { processQueryWithExhaustiveFolderRead } from './exhaustiveFolderRead'
+
+jest.mock('../llm/manager', () => ({
+  getChatModelClient: jest.fn(),
+}))
+
+const mockedGetChatModelClient = getChatModelClient as jest.MockedFunction<
+  typeof getChatModelClient
+>
+
+function createFile(path: string, mtime: number): TFile {
+  return {
+    path,
+    name: path.split('/').at(-1) ?? path,
+    extension: 'md',
+    stat: {
+      ctime: mtime,
+      mtime,
+      size: 1,
+    },
+  } as TFile
+}
+
+function createSettings(
+  overrides: Partial<SmartComposerSettings> = {},
+): SmartComposerSettings {
+  return {
+    version: 18,
+    providers: [...DEFAULT_PROVIDERS],
+    chatModels: [...DEFAULT_CHAT_MODELS],
+    embeddingModels: [],
+    chatModelId: 'claude-sonnet-4.6 (plan)',
+    applyModelId: 'gpt-4.1-mini',
+    embeddingModelId: 'openai/text-embedding-3-small',
+    systemPrompt: '',
+    ragOptions: {
+      retrievalMode: 'plan-rerank',
+      folderReadMode: 'auto',
+      chunkSize: 1000,
+      thresholdTokens: 1,
+      exhaustiveDirectTokenLimit: 60000,
+      minSimilarity: 0,
+      limit: 2,
+      planRerankCandidateLimit: 40,
+      excludePatterns: [],
+      includePatterns: [],
+    },
+    mcp: { servers: [] },
+    chatOptions: {
+      includeCurrentFileContent: true,
+      enableTools: true,
+      maxAutoIterations: 1,
+    },
+    ...overrides,
+  }
+}
+
+describe('processQueryWithExhaustiveFolderRead', () => {
+  beforeEach(() => {
+    jest.clearAllMocks()
+  })
+
+  it('includes every file directly when the folder fits the token limit', async () => {
+    const firstFile = createFile('notes/first.md', 1)
+    const secondFile = createFile('notes/second.md', 2)
+    const app = {
+      vault: {
+        cachedRead: jest.fn(async (file: TFile) =>
+          file.path.includes('first') ? 'first content' : 'second content',
+        ),
+      },
+    } as unknown as App
+
+    const result = await processQueryWithExhaustiveFolderRead({
+      app,
+      settings: createSettings(),
+      query: '전부 정독해줘',
+      files: [firstFile, secondFile],
+      scopeType: 'folders',
+    })
+
+    expect(result.promptText).toContain('Context mode: exhaustive folder read')
+    expect(result.promptText).toContain('first content')
+    expect(result.promptText).toContain('second content')
+    expect(result.retrievalMetadata).toMatchObject({
+      retrievalMode: 'exhaustive-direct',
+      totalFilesRead: 2,
+      exhaustive: true,
+    })
+    expect(result.similaritySearchResults).toHaveLength(2)
+    expect(mockedGetChatModelClient).not.toHaveBeenCalled()
+  })
+
+  it('summarizes all chunks in batches when the folder exceeds the direct token limit', async () => {
+    const firstFile = createFile('notes/first.md', 1)
+    const secondFile = createFile('notes/second.md', 2)
+    const generateResponse = jest.fn().mockResolvedValue({
+      id: 'summary',
+      model: 'claude-sonnet-4-6',
+      object: 'chat.completion',
+      choices: [
+        {
+          finish_reason: 'stop',
+          message: {
+            role: 'assistant',
+            content: 'batch summary covering both notes',
+          },
+        },
+      ],
+    })
+    mockedGetChatModelClient.mockReturnValue({
+      model: {
+        providerType: 'anthropic-plan',
+        providerId: 'anthropic-plan',
+        id: 'claude-sonnet-4.6 (plan)',
+        model: 'claude-sonnet-4-6',
+      },
+      providerClient: {
+        generateResponse,
+      },
+    } as unknown as ReturnType<typeof getChatModelClient>)
+    const app = {
+      vault: {
+        cachedRead: jest.fn(async (file: TFile) =>
+          file.path.includes('first')
+            ? 'first long content'
+            : 'second long content',
+        ),
+      },
+    } as unknown as App
+
+    const result = await processQueryWithExhaustiveFolderRead({
+      app,
+      settings: createSettings({
+        ragOptions: {
+          ...createSettings().ragOptions,
+          exhaustiveDirectTokenLimit: 1,
+        },
+      }),
+      query: '전부 정독해줘',
+      files: [firstFile, secondFile],
+      scopeType: 'folders',
+    })
+
+    expect(generateResponse).toHaveBeenCalledTimes(1)
+    expect(JSON.stringify(generateResponse.mock.calls[0])).toContain(
+      'notes/first.md',
+    )
+    expect(JSON.stringify(generateResponse.mock.calls[0])).toContain(
+      'notes/second.md',
+    )
+    expect(result.promptText).toContain('batch summary covering both notes')
+    expect(result.retrievalMetadata).toMatchObject({
+      retrievalMode: 'exhaustive-batch',
+      totalFilesRead: 2,
+      exhaustive: true,
+    })
+  })
+})
